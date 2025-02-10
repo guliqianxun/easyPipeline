@@ -7,8 +7,9 @@
 @Desc    : pipeline 执行最小单元 
 '''
 import logging
+from datetime import datetime
 from .step import PipelineStep
-from .types import StepStatus
+from .types import StepStatus, MetricsData
 from typing import List, Dict, Optional, Any
 
 class Pipeline:
@@ -18,6 +19,7 @@ class Pipeline:
         self.steps: List[PipelineStep] = []
         self.logger = logger if logger is not None else logging.getLogger(f"pipeline.{name}")
         self._validate_dependencies = True
+        self.metrics = MetricsData()
         self.result = None
         self.intermediate_results = {}
 
@@ -35,7 +37,33 @@ class Pipeline:
 
     def logger_set(self, logger: logging.Logger):
         self.logger = logger
+        
+    def update_step(self, old_step_name: str, new_step: PipelineStep) -> None:
+        """Update an existing step in the pipeline"""
+        # Find the index of the old step
+        old_step_index = next((i for i, step in enumerate(self.steps) if step.name == old_step_name), None)
+        
+        if old_step_index is None:
+            raise ValueError(f"Step {old_step_name} not found in the pipeline")
 
+        # Verify dependencies of the new step
+        if self._validate_dependencies:
+            self._verify_dependencies(new_step)
+
+        # Replace the old step with the new step
+        old_step = self.steps[old_step_index]
+        self.steps[old_step_index] = new_step
+
+        # Update reference counts for dependencies
+        for dep in old_step.dependencies:
+            self.reference_count[dep] -= 1
+            if self.reference_count[dep] <= 0:
+                del self.reference_count[dep]
+
+        for dep in new_step.dependencies:
+            self.reference_count[dep] = self.reference_count.get(dep, 0) + 1
+
+        self.logger.info(f"Replaced step: {old_step_name} with {new_step.name}")
         
     def _verify_dependencies(self, step: PipelineStep) -> None:
         """Verify that all dependencies are met"""
@@ -53,9 +81,18 @@ class Pipeline:
                 del self.intermediate_results[step_name]
                 del self.reference_count[step_name]
 
+    def log_pipeline_info(self) -> None:
+        """Log pipeline information and metrics"""
+        self.logger.info(f"Pipeline: {self.name}")
+        self.logger.info(f"Description: {self.description}")
+        self.logger.info(f"Total steps: {len(self.steps)}")
+        if self.metrics.duration_seconds is not None:
+            self.logger.info(f"Duration: {self.metrics.duration_seconds:.2f}s")
+
     def execute(self, data: Any) -> Any:
         """Execute all steps in the pipeline"""
         self.logger.info(f"Starting pipeline execution: {self.name}")
+        self.metrics.start_time = datetime.now()
         current_data = data
 
         for step in self.steps:
@@ -71,8 +108,9 @@ class Pipeline:
             except Exception as e:
                 self.logger.error(f"Pipeline failed at step {step.name}: {str(e)}")
                 raise
-
-        self.logger.info("Pipeline execution completed successfully")
+        self.metrics.end_time = datetime.now()
+        self.metrics.duration_seconds = (self.metrics.end_time - self.metrics.start_time).total_seconds()
+        self.logger.info(f"{self.name} execution completed successfully in {self.metrics.duration_seconds:.2f} seconds")
         self.result = current_data
         return current_data
 
