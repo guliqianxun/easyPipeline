@@ -22,6 +22,7 @@ class Pipeline:
         self.metrics = MetricsData()
         self.result = None
         self.intermediate_results = {}
+        self.reference_count = {}
 
     def add_step(self, step: PipelineStep) -> None:
         """Add a processing step to the pipeline"""

@@ -10,7 +10,7 @@ import logging
 from datetime import datetime
 from typing import Dict, Any, Union, List, Optional
 from .pipeline import Pipeline
-from multiprocessing import Pool
+from multiprocessing import Pool, freeze_support
 import pickle
 from .types import StepStatus, MetricsData
 import os
@@ -177,6 +177,7 @@ class BatchPipelineManager:
         self.pipelines: Dict[str, Pipeline] = {}
         self.logger = logger or logging.getLogger(f"pipeline_manager.{name}")
         self.execution_metrics: Dict[str, Dict] = {}
+        freeze_support() 
 
     def add_pipeline(self, pipeline: Pipeline) -> None:
         """Register a pipeline template"""
@@ -246,19 +247,24 @@ class BatchPipelineManager:
         total_start_time = datetime.now()
 
         try:
-            with Pool(processes=actual_workers) as pool:
-                completed_chunks = 0
-                
-                for chunk_result in pool.imap_unordered(_pipeline_worker, worker_args):
+            # Try parallel processing first
+            try:
+                with Pool(processes=actual_workers) as pool:
+                    completed_chunks = 0
+                    for chunk_result in pool.imap_unordered(_pipeline_worker, worker_args):
+                        results.extend(chunk_result)
+                        completed_chunks += 1
+                        self.logger.info(
+                            f"Progress: {completed_chunks}/{len(chunks)} chunks completed "
+                            f"({len(results)}/{len(input_data_list)} total items)"
+                        )
+                        self._update_metrics(pipeline_name, chunk_result)
+            except RuntimeError:
+                # Fall back to sequential processing if multiprocessing fails
+                self.logger.warning("Falling back to sequential processing")
+                for args in worker_args:
+                    chunk_result = _pipeline_worker(args)
                     results.extend(chunk_result)
-                    completed_chunks += 1
-                    
-                    # Log progress by chunks
-                    self.logger.info(
-                        f"Progress: {completed_chunks}/{len(chunks)} chunks completed "
-                        f"({len(results)}/{len(input_data_list)} total items)"
-                    )
-                    
                     self._update_metrics(pipeline_name, chunk_result)
 
         except Exception as e:
