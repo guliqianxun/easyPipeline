@@ -25,7 +25,7 @@ class PipelineStep(ABC):
         dependencies: List[str] = None,
         preconditions: List[str] = None,
         postconditions: List[str] = None,
-        execution_mode: ExecutionMode = ExecutionMode.SYNCHRONOUS,
+        execution_mode: ExecutionMode = ExecutionMode.SEQUENTIAL,
         timeout: int = 3600,
         error_handling: str = "stop",
         retry_policy: RetryPolicy = None,

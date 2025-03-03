@@ -3,122 +3,444 @@
 @Author  : Zhiheng Liu
 @Email   : visitorindark@gmail.com
 @CreateDate    : 2024/11/11 15:35 
-@ModifyDate    : 2024/11/11 15:35
+@ModifyDate    : 2025/02/11 15:35
 @Desc    : pipeline Manager 管理单元，负责一整套算法的调度
 '''
 import logging
 from datetime import datetime
-from typing import Dict, Any, Union, List, Optional
+from typing import Dict, Any, Union, List, Optional, Tuple
 from .pipeline import Pipeline
-from multiprocessing import Pool, freeze_support
+from .types import ProgressCallback, ExecutionMode
+from multiprocessing import freeze_support
 import pickle
-from .types import StepStatus, MetricsData
 import os
+import threading
+from .task_scheduler import TaskScheduler, TaskStatus
 
-
-def _pipeline_worker(args):
-    """Worker function to run pipeline instance with specific input"""
-    pipeline_pickle, input_data_list, chunk_id = args
-    
-    if not isinstance(input_data_list, list):
-        input_data_list = [input_data_list]
-        
-    results = []
-    pipeline = pickle.loads(pipeline_pickle)
-    logger = logging.getLogger(f"pipeline.{pipeline.name}.{chunk_id}")
-    pipeline.logger = logger
-    
-    logger.info(f"Starting chunk {chunk_id} with {len(input_data_list)} items")
-    
-    for i, input_data in enumerate(input_data_list):
-        try:
-            result = pipeline.execute(input_data)
-            results.append({
-                'instance_id': f"{chunk_id}_item_{i}",
-                'input_data': input_data,
-                'status': pipeline.get_status(),
-                'result': result,
-                'metrics': pipeline.metrics,
-                'success': True,
-                'error': None
-            })
-        except Exception as e:
-            results.append({
-                'instance_id': f"{chunk_id}_item_{i}",
-                'input_data': input_data,
-                'status': {
-                    'pipeline_name': pipeline.name,
-                    'status': StepStatus.FAILED.value,
-                    'error': str(e)
-                },
-                'result': None,
-                'metrics': MetricsData(
-                    start_time=datetime.now(),
-                    end_time=datetime.now(),
-                    custom_metrics={'error': str(e)}
-                ),
-                'success': False,
-                'error': str(e)
-            })
-            logger.error(f"Failed processing item {i} in chunk {chunk_id}: {e}")
-    
-    return results
+def _create_child_logger(parent_logger, suffix, level_decrease=10):
+    """Create a child logger with a decreased level"""
+    logger_name = f"{parent_logger.name}.{suffix}"
+    logger = logging.getLogger(logger_name)
+    new_level = max(logging.DEBUG, parent_logger.level - level_decrease)
+    logger.setLevel(new_level)
+    return logger
 
 class PipelineManager:
-    """Manages the execution and aggregation of multiple pipelines"""
+    """
+    Unified manager for pipeline execution with multiple execution strategies.
     
-    def __init__(self, name: str = "pipeline_manager", logger: logging.Logger = None):
+    The manager supports three execution modes:
+    - SEQUENTIAL: Execute pipelines one at a time, process data sequentially
+    - PARALLEL: Execute pipelines in parallel, but each pipeline processes data sequentially
+    - BATCH: Execute data in batches through pipelines, with each data chunk processed in parallel
+    
+    It also implements hierarchical logging, where each component logs at a progressively
+    lower level to maintain readable logs.
+    """
+    
+    def __init__(self, 
+                 name: str = "pipeline_manager",
+                 execution_mode: ExecutionMode = ExecutionMode.SEQUENTIAL,
+                 max_workers: Optional[int] = None,
+                 min_workers: Optional[int] = 1,
+                 logger: logging.Logger = None,
+                 callbacks: Optional[List[ProgressCallback]] = None):
+        """
+        Initialize the pipeline manager.
+        
+        Args:
+            name: Unique name for this manager
+            execution_mode: Mode of execution (SEQUENTIAL, PARALLEL, BATCH)
+            max_workers: Maximum number of worker processes (defaults to CPU count)
+            min_workers: Minimum number of worker processes
+            logger: Optional logger (creates one if not provided)
+            callbacks: Optional list of progress callbacks
+        """
         self.name = name
+        self.execution_mode = execution_mode
+        self.max_workers = max_workers or os.cpu_count()
+        self.min_workers = min_workers
         self.pipelines: Dict[str, Pipeline] = {}
         self.logger = logger if logger is not None else logging.getLogger(f"pipeline_manager.{name}")
+        self.callbacks = callbacks or []
+        
         # To track execution metrics
-        self.execution_metrics: Dict[str, Dict[str, Union[int, float]]] = {
-            # Example format: 'pipeline_name': {'call_count': 0, 'total_duration': 0.0}
-        }
+        self.execution_metrics: Dict[str, Dict[str, Union[int, float]]] = {}
+        
+        # For cancellation support
+        self._cancel_event = threading.Event()
+        
+        # Initialize task scheduler
+        self.task_scheduler = TaskScheduler(
+            max_workers=self.max_workers,
+            min_workers=self.min_workers,
+            logger=_create_child_logger(self.logger, "scheduler")
+        )
+        self.task_scheduler.set_result_callback(self._on_task_completed)
+        
+        # Task ID mappings
+        self._pipeline_tasks: Dict[str, Dict[str, str]] = {}  # {pipeline_name: {data_id: task_id}}
+        self._batch_tasks: Dict[str, List[str]] = {}  # {pipeline_name: [task_ids]}
+        
+        # Initialize multiprocessing support if needed
+        if execution_mode in [ExecutionMode.PARALLEL, ExecutionMode.BATCH]:
+            freeze_support()
+            # Start the scheduler
+            self.task_scheduler.start()
 
     def add_pipeline(self, pipeline: Pipeline) -> None:
-        """Add a pipeline to the manager"""
+        """
+        Add a pipeline to the manager with hierarchical logging.
+        
+        Args:
+            pipeline: Pipeline instance to add
+        """
+        # Set up hierarchical logging
+        pipeline_logger = _create_child_logger(self.logger, pipeline.name)
+        pipeline.logger = pipeline_logger
+        
+        # Add pipeline and initialize metrics
         self.pipelines[pipeline.name] = pipeline
-        self.execution_metrics[pipeline.name] = {'call_count': 0, 'total_duration': 0.0}
+        self.execution_metrics[pipeline.name] = {'call_count': 0, 
+                                               'total_duration': 0.0,
+                                               'success_count': 0,
+                                               'failure_count': 0}
+        
         self.logger.info(f"Added pipeline: {pipeline.name}")
+        
+        # Pass any callbacks to the pipeline
+        for callback in self.callbacks:
+            if callback not in pipeline.callbacks:
+                pipeline.callbacks.append(callback)
 
     def remove_pipeline(self, pipeline_name: str) -> None:
-        """Remove a pipeline from the manager"""
+        """
+        Remove a pipeline from the manager.
+        
+        Args:
+            pipeline_name: Name of the pipeline to remove
+        """
         if pipeline_name in self.pipelines:
             del self.pipelines[pipeline_name]
             del self.execution_metrics[pipeline_name]
             self.logger.info(f"Removed pipeline: {pipeline_name}")
+        else:
+            self.logger.warning(f"Attempted to remove non-existent pipeline: {pipeline_name}")
 
-    def execute_pipeline(self, pipeline_name: str, data: Any) -> Any:
-        """Execute the specified pipeline and track its metrics"""
+    def execute_pipeline(self, pipeline_name: str, data: Any, 
+                        timeout: Optional[float] = None) -> Any:
+        """
+        Execute a single pipeline and track its metrics.
+        
+        Args:
+            pipeline_name: Name of the pipeline to execute
+            data: Input data for the pipeline
+            timeout: Optional timeout in seconds
+            
+        Returns:
+            Result of the pipeline execution
+            
+        Raises:
+            ValueError: If pipeline not found
+            TimeoutError: If execution exceeds timeout
+        """
         if pipeline_name not in self.pipelines:
             raise ValueError(f"Pipeline {pipeline_name} not found")
         
         pipeline = self.pipelines[pipeline_name]
-
         
-        result = pipeline.execute(data)  # Execute the pipeline
-        duration = pipeline.metrics.duration_seconds
-        
-        self.execution_metrics[pipeline_name]['call_count'] += 1
-        self.execution_metrics[pipeline_name]['total_duration'] += duration
-        return result
-
-    def execute_all(self, data: Any) -> Dict[str, Any]:
-        """Execute all registered pipelines and track their metrics"""
-        results = {}
-        for name, pipeline in self.pipelines.items():
+        # Notify execution start
+        for callback in self.callbacks:
             try:
-                self.logger.info(f"Executing pipeline: {name}")
-                results[name] = self.execute_pipeline(name, data)
+                callback.on_pipeline_start(pipeline_name, data)
             except Exception as e:
-                self.logger.error(f"Pipeline {name} failed: {str(e)}")
-                results[name] = None
+                self.logger.warning(f"Callback error on pipeline start: {str(e)}")
+        
+        start_time = datetime.now()
+        
+        try:
+            self.logger.info(f"Executing pipeline: {pipeline_name}")
+            
+            if self.execution_mode == ExecutionMode.SEQUENTIAL:
+                # Direct execution in the current process
+                result = pipeline.execute(data)
+            else:
+                # Execute via task scheduler
+                pipeline_pickle = pickle.dumps(pipeline)
+                task_id = self.task_scheduler.submit_pipeline_task(
+                    pipeline_name, pipeline_pickle, data, timeout
+                )
+                
+                # Store the task ID for tracking
+                data_id = id(data)
+                if pipeline_name not in self._pipeline_tasks:
+                    self._pipeline_tasks[pipeline_name] = {}
+                self._pipeline_tasks[pipeline_name][str(data_id)] = task_id
+                
+                # Wait for the task to complete
+                if not self.task_scheduler.wait_for_tasks([task_id], timeout):
+                    raise TimeoutError(f"Pipeline execution timed out after {timeout} seconds")
+                
+                # Get the result
+                result = self.task_scheduler.get_task_result(task_id)
+                status = self.task_scheduler.get_task_status(task_id)
+                
+                if status == TaskStatus.FAILED:
+                    task = self.task_scheduler.tasks.get(task_id)
+                    if task and task.error:
+                        raise RuntimeError(f"Pipeline execution failed: {task.error}")
+            
+            # Track success metrics
+            duration = (datetime.now() - start_time).total_seconds()
+            self._update_metrics(pipeline_name, True, duration)
+            
+            # Notify execution completion
+            for callback in self.callbacks:
+                try:
+                    callback.on_pipeline_complete(pipeline_name, result, duration)
+                except Exception as e:
+                    self.logger.warning(f"Callback error on pipeline completion: {str(e)}")
+            
+            return result
+            
+        except Exception as e:
+            # Track failure metrics
+            duration = (datetime.now() - start_time).total_seconds()
+            self._update_metrics(pipeline_name, False, duration)
+            
+            # Notify execution failure
+            for callback in self.callbacks:
+                try:
+                    callback.on_pipeline_error(pipeline_name, e, duration)
+                except Exception as callback_e:
+                    self.logger.warning(f"Callback error on pipeline error: {str(callback_e)}")
+            
+            self.logger.error(f"Pipeline {pipeline_name} failed: {str(e)}")
+            raise
+
+    def execute(self, pipeline_data_map: Dict[str, Any], 
+                chunk_size: Optional[int] = None, 
+                timeout: Optional[float] = None) -> Dict[str, Any]:
+        """
+        Execute pipelines based on a mapping of pipeline names to their input data.
+        
+        Args:
+            pipeline_data_map: Dictionary mapping pipeline names to their input data
+                             For batch mode, values should be lists of data items
+            chunk_size: Optional size of data chunks for batch processing
+            timeout: Optional timeout in seconds
+            
+        Returns:
+            Dictionary mapping pipeline names to their results
+            For batch mode, values are lists of result dictionaries
+            
+        Raises:
+            ValueError: If pipeline not found
+        """
+        # Reset cancellation flag
+        self._cancel_event.clear()
+        
+        # Validate pipeline names
+        invalid_pipelines = [name for name in pipeline_data_map.keys() if name not in self.pipelines]
+        if invalid_pipelines:
+            raise ValueError(f"Invalid pipeline names: {invalid_pipelines}")
+        
+        results = {}
+        
+        # Start the scheduler if it's not running
+        if not self.task_scheduler._running and self.execution_mode != ExecutionMode.SEQUENTIAL:
+            self.task_scheduler.start()
+        
+        # Execute based on mode
+        if self.execution_mode == ExecutionMode.SEQUENTIAL:
+            # One pipeline at a time
+            for name, data in pipeline_data_map.items():
+                if isinstance(data, list) and len(data) > 0:
+                    results[name] = self.execute_batch(name, data, chunk_size, timeout)
+                else:
+                    try:
+                        results[name] = self.execute_pipeline(name, data, timeout)
+                    except Exception as e:
+                        self.logger.error(f"Pipeline {name} failed: {str(e)}")
+                        results[name] = None
+        
+        elif self.execution_mode == ExecutionMode.PARALLEL:
+            # All pipelines in parallel
+            task_ids = {}
+            
+            for name, data in pipeline_data_map.items():
+                if isinstance(data, list) and len(data) > 0:
+                    # Handle batch data
+                    batch_results = self.execute_batch(name, data, chunk_size, timeout)
+                    results[name] = batch_results
+                else:
+                    # Schedule single pipeline execution
+                    pipeline = self.pipelines[name]
+                    pipeline_pickle = pickle.dumps(pipeline)
+                    
+                    task_id = self.task_scheduler.submit_pipeline_task(
+                        name, pipeline_pickle, data, timeout
+                    )
+                    task_ids[name] = task_id
+            
+            # Wait for all pipeline tasks to complete
+            if task_ids:
+                self.task_scheduler.wait_for_tasks(list(task_ids.values()), timeout)
+                
+                # Collect results
+                for name, task_id in task_ids.items():
+                    status = self.task_scheduler.get_task_status(task_id)
+                    
+                    if status == TaskStatus.COMPLETED:
+                        results[name] = self.task_scheduler.get_task_result(task_id)
+                    else:
+                        self.logger.error(f"Pipeline {name} task did not complete successfully: {status}")
+                        results[name] = None
+        
+        elif self.execution_mode == ExecutionMode.BATCH:
+            # Process all data in batches
+            for name, data in pipeline_data_map.items():
+                if isinstance(data, list) and len(data) > 0:
+                    results[name] = self.execute_batch(name, data, chunk_size, timeout)
+                else:
+                    # Single item as a batch of one
+                    results[name] = self.execute_batch(name, [data], chunk_size, timeout)[0]
+        
         return results
 
-    def get_results(self) -> Dict[str, Any]:
-        """Get results from all pipelines"""
-        return {name: pipeline.get_result() for name, pipeline in self.pipelines.items()}
+    def execute_batch(self, pipeline_name: str, input_data_list: List[Any], 
+                     chunk_size: Optional[int] = None,
+                     timeout: Optional[float] = None) -> List[Dict]:
+        """
+        Execute a batch of data through a pipeline.
+        
+        Args:
+            pipeline_name: Name of the pipeline to execute
+            input_data_list: List of data items to process
+            chunk_size: Optional size of data chunks for each worker
+            timeout: Optional timeout in seconds
+            
+        Returns:
+            List of result dictionaries with status, result, and error information
+        """
+        if pipeline_name not in self.pipelines:
+            raise ValueError(f"Pipeline {pipeline_name} not found")
+            
+        # 处理空列表输入
+        if not input_data_list:
+            self.logger.info(f"Empty input list for batch execution of {pipeline_name}")
+            return []
+        
+        pipeline = self.pipelines[pipeline_name]
+        start_time = datetime.now()
+        
+        try:
+            self.logger.info(f"Starting batch execution for pipeline {pipeline_name} "
+                           f"with {len(input_data_list)} items")
+            
+            # Determine chunk size if not specified
+            if chunk_size is None:
+                chunk_size = max(1, len(input_data_list) // self.max_workers)
+                self.logger.info(f"Auto-calculated chunk size: {chunk_size}")
+            
+            # Create chunks of data
+            chunks = [
+                input_data_list[i:i + chunk_size]
+                for i in range(0, len(input_data_list), chunk_size)
+            ]
+            
+            # Use task scheduler for batch processing
+            pipeline_pickle = pickle.dumps(pipeline)
+            task_ids = []
+            
+            # Submit tasks for each chunk
+            for i, chunk in enumerate(chunks):
+                chunk_id = f"{pipeline_name}_chunk_{i}"
+                task_id = self.task_scheduler.submit_data_chunk_task(
+                    pipeline_name, pipeline_pickle, chunk, chunk_id, timeout
+                )
+                task_ids.append(task_id)
+            
+            # Track batch tasks
+            self._batch_tasks[pipeline_name] = task_ids
+            
+            # Wait for all chunks to complete
+            all_completed = self.task_scheduler.wait_for_tasks(task_ids, timeout)
+            
+            if not all_completed:
+                self.logger.warning(f"Timeout waiting for batch execution of {pipeline_name}")
+            
+            # Collect results from all completed chunks
+            all_results = []
+            success_count = 0
+            failure_count = 0
+            
+            for task_id in task_ids:
+                status = self.task_scheduler.get_task_status(task_id)
+                
+                if status == TaskStatus.COMPLETED:
+                    chunk_results = self.task_scheduler.get_task_result(task_id)
+                    all_results.extend(chunk_results)
+                    
+                    # Count successes and failures
+                    success_count += sum(1 for r in chunk_results if r.get('success', False))
+                    failure_count += sum(1 for r in chunk_results if not r.get('success', False))
+                else:
+                    self.logger.error(f"Chunk task {task_id} did not complete successfully: {status}")
+            
+            # Track metrics
+            duration = (datetime.now() - start_time).total_seconds()
+            self.execution_metrics[pipeline_name]['call_count'] += len(input_data_list)
+            self.execution_metrics[pipeline_name]['total_duration'] += duration
+            self.execution_metrics[pipeline_name]['success_count'] += success_count
+            self.execution_metrics[pipeline_name]['failure_count'] += failure_count
+            
+            self.logger.info(f"Batch execution completed: {success_count} successes, "
+                           f"{failure_count} failures in {duration:.2f}s")
+            
+            return all_results
+            
+        except Exception as e:
+            self.logger.error(f"Batch execution for pipeline {pipeline_name} failed: {str(e)}")
+            raise
+
+    def cancel_execution(self):
+        """Signal cancellation for any ongoing batch executions"""
+        self.logger.warning("Cancellation requested for execution")
+        self._cancel_event.set()
+        self.task_scheduler.cancel_all()
+
+    def _update_metrics(self, pipeline_name: str, success: bool, duration: float) -> None:
+        """Update execution metrics for a pipeline"""
+        if pipeline_name not in self.execution_metrics:
+            return
+            
+        self.execution_metrics[pipeline_name]['call_count'] += 1
+        self.execution_metrics[pipeline_name]['total_duration'] += duration
+        
+        if success:
+            self.execution_metrics[pipeline_name]['success_count'] += 1
+        else:
+            self.execution_metrics[pipeline_name]['failure_count'] += 1
+
+    def _on_task_completed(self, task_id: str, result: Any) -> None:
+        """Callback when a task is completed"""
+        # This could be used to implement additional logic when tasks complete
+        pass
+
+    def cleanup(self) -> None:
+        """Clean up resources and completed tasks"""
+        # Stop scheduler if running
+        if hasattr(self, 'task_scheduler') and self.task_scheduler._running:
+            self.task_scheduler.stop(wait=True, timeout=1.0)
+            self.task_scheduler.clear_completed_tasks()
+
+    def __del__(self):
+        """Ensure resources are cleaned up when this object is deleted"""
+        try:
+            self.cleanup()
+        except:
+            pass
 
     def summarize_metrics(self) -> Dict[str, Any]:
         """
@@ -129,17 +451,35 @@ class PipelineManager:
             - Total pipelines called
             - Total execution time across all pipelines
             - Mean execution time per pipeline
+            - Success/failure counts and rates
         """
         total_pipelines = len(self.execution_metrics)
         total_duration = sum(metrics['total_duration'] for metrics in self.execution_metrics.values())
         total_calls = sum(metrics['call_count'] for metrics in self.execution_metrics.values())
+        total_success = sum(metrics['success_count'] for metrics in self.execution_metrics.values())
+        total_failures = sum(metrics['failure_count'] for metrics in self.execution_metrics.values())
+        
         mean_duration = total_duration / total_calls if total_calls > 0 else 0.0
+        success_rate = (total_success / total_calls * 100) if total_calls > 0 else 0.0
 
         summary = {
             "total_pipelines": total_pipelines,
             "total_calls": total_calls,
             "total_duration": total_duration,
             "mean_duration": mean_duration,
+            "total_success": total_success,
+            "total_failures": total_failures,
+            "success_rate": success_rate,
+            "detailed_metrics": {
+                name: {
+                    "calls": metrics["call_count"],
+                    "duration": metrics["total_duration"],
+                    "avg_duration": metrics["total_duration"] / metrics["call_count"] if metrics["call_count"] > 0 else 0,
+                    "success_rate": (metrics["success_count"] / metrics["call_count"] * 100) 
+                                    if metrics["call_count"] > 0 else 0
+                }
+                for name, metrics in self.execution_metrics.items()
+            }
         }
 
         self.logger.info(f"Pipeline Metrics Summary: {summary}")
@@ -149,6 +489,7 @@ class PipelineManager:
         """Get the current status of all pipelines and their metrics"""
         return {
             "manager_name": self.name,
+            "execution_mode": self.execution_mode.value,
             "total_pipelines": len(self.pipelines),
             "pipeline_statuses": {
                 name: pipeline.get_status()
@@ -161,146 +502,12 @@ class PipelineManager:
         """Log metrics for each pipeline"""
         self.logger.info("Pipeline Execution Metrics:")
         for name, metrics in self.execution_metrics.items():
-            self.logger.info(
-                f"Pipeline: {name}, Call Count: {metrics['call_count']}, Total Duration: {metrics['total_duration']:.2f}s"
-            )
-
-
-class BatchPipelineManager:
-    """Manager for parallel execution of pipeline instances with different inputs"""
-    
-    def __init__(self, name: str = "batch_pipeline_manager",
-                 max_workers: Optional[int] = None,
-                 logger: Optional[logging.Logger] = None):
-        self.name = name
-        self.max_workers = max_workers or os.cpu_count()
-        self.pipelines: Dict[str, Pipeline] = {}
-        self.logger = logger or logging.getLogger(f"pipeline_manager.{name}")
-        self.execution_metrics: Dict[str, Dict] = {}
-        freeze_support() 
-
-    def add_pipeline(self, pipeline: Pipeline) -> None:
-        """Register a pipeline template"""
-        self.pipelines[pipeline.name] = pipeline
-        self.execution_metrics[pipeline.name] = {
-            'total_instances': 0,
-            'successful_instances': 0,
-            'failed_instances': 0,
-            'total_duration': 0.0,
-            'avg_duration': 0.0
-        }
-        self.logger.info(f"Added pipeline: {pipeline.name}")
-
-    def execute_batch(self, pipeline_name: str, input_data_list: List[Dict], 
-                     chunk_size: Optional[int] = None) -> List[Dict]:
-        """
-        Execute multiple instances of a pipeline with different inputs in parallel
-        
-        Args:
-            pipeline_name: Name of the pipeline to execute
-            input_data_list: List of input data dictionaries
-            chunk_size: Optional; Number of items to process in each worker.
-                       If not provided, will be set to len(input_data_list) / max_workers
+            calls = metrics['call_count']
+            duration = metrics['total_duration']
+            avg_duration = duration / calls if calls > 0 else 0
+            success_rate = (metrics['success_count'] / calls * 100) if calls > 0 else 0
             
-        Returns:
-            List of results dictionaries containing status and output for each instance
-        """
-        if pipeline_name not in self.pipelines:
-            raise ValueError(f"Pipeline {pipeline_name} not found")
-
-        pipeline = self.pipelines[pipeline_name]
-        
-        # Calculate optimal chunk size if not provided
-        if chunk_size is None:
-            chunk_size = max(1, len(input_data_list) // self.max_workers)
-            self.logger.info(f"Auto-calculated chunk size: {chunk_size} "
-                           f"(total items: {len(input_data_list)}, workers: {self.max_workers})")
-        
-        # Adjust number of workers based on chunk size and total items
-        actual_workers = min(
-            self.max_workers,
-            (len(input_data_list) + chunk_size - 1) // chunk_size
-        )
-        
-        try:
-            pipeline_pickle = pickle.dumps(pipeline)
-        except Exception as e:
-            self.logger.error(f"Failed to pickle pipeline {pipeline_name}: {e}")
-            raise
-
-        # Group input data into chunks
-        chunks = [
-            input_data_list[i:i + chunk_size]
-            for i in range(0, len(input_data_list), chunk_size)
-        ]
-        
-        # Prepare worker arguments
-        worker_args = [
-            (pipeline_pickle, chunk_data, f"chunk_{i}")
-            for i, chunk_data in enumerate(chunks)
-        ]
-
-        self.logger.info(f"Starting batch execution with {actual_workers} workers, "
-                        f"{len(chunks)} chunks, chunk size {chunk_size}")
-
-        results = []
-        total_start_time = datetime.now()
-
-        try:
-            # Try parallel processing first
-            try:
-                with Pool(processes=actual_workers) as pool:
-                    completed_chunks = 0
-                    for chunk_result in pool.imap_unordered(_pipeline_worker, worker_args):
-                        results.extend(chunk_result)
-                        completed_chunks += 1
-                        self.logger.info(
-                            f"Progress: {completed_chunks}/{len(chunks)} chunks completed "
-                            f"({len(results)}/{len(input_data_list)} total items)"
-                        )
-                        self._update_metrics(pipeline_name, chunk_result)
-            except RuntimeError:
-                # Fall back to sequential processing if multiprocessing fails
-                self.logger.warning("Falling back to sequential processing")
-                for args in worker_args:
-                    chunk_result = _pipeline_worker(args)
-                    results.extend(chunk_result)
-                    self._update_metrics(pipeline_name, chunk_result)
-
-        except Exception as e:
-            self.logger.error(f"Batch execution failed: {e}")
-            raise
-        finally:
-            self._finalize_metrics(pipeline_name, total_start_time)
-
-        return results
-
-    def get_status(self) -> Dict:
-        """Get status and metrics for all pipelines"""
-        return {
-            "manager_name": self.name,
-            "total_pipelines": len(self.pipelines),
-            "execution_metrics": self.execution_metrics,
-        }
-
-    def _update_metrics(self, pipeline_name: str, chunk_result: List[Dict]) -> None:
-        """Update metrics based on the results of a chunk"""
-        for result in chunk_result:
-            self.execution_metrics[pipeline_name]['total_instances'] += 1
-            if result['success']:
-                self.execution_metrics[pipeline_name]['successful_instances'] += 1
-            else:
-                self.execution_metrics[pipeline_name]['failed_instances'] += 1
-                self.logger.error(
-                    f"Pipeline instance {result['instance_id']} failed: {result['error']}"
-                )
-
-    def _finalize_metrics(self, pipeline_name: str, total_start_time: datetime) -> None:
-        """Finalize metrics after batch execution"""
-        total_duration = (datetime.now() - total_start_time).total_seconds()
-        self.execution_metrics[pipeline_name]['total_duration'] += total_duration
-        if self.execution_metrics[pipeline_name]['total_instances'] > 0:
-            self.execution_metrics[pipeline_name]['avg_duration'] = (
-                self.execution_metrics[pipeline_name]['total_duration'] /
-                self.execution_metrics[pipeline_name]['total_instances']
+            self.logger.info(
+                f"Pipeline: {name}, Calls: {calls}, Total Duration: {duration:.2f}s, "
+                f"Avg Duration: {avg_duration:.2f}s, Success Rate: {success_rate:.1f}%"
             )

@@ -7,13 +7,14 @@
 @Desc    : pipeline 执行最小单元 
 '''
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from .step import PipelineStep
-from .types import StepStatus, MetricsData
+from .types import StepStatus, MetricsData, ProgressCallback
 from typing import List, Dict, Optional, Any
 
 class Pipeline:
-    def __init__(self, name: str, description: str = "", logger: logging.Logger = None):
+    def __init__(self, name: str, description: str = "", logger: logging.Logger = None, 
+                 callbacks: Optional[List[ProgressCallback]] = None):
         self.name = name
         self.description = description
         self.steps: List[PipelineStep] = []
@@ -23,6 +24,7 @@ class Pipeline:
         self.result = None
         self.intermediate_results = {}
         self.reference_count = {}
+        self.callbacks = callbacks or []
 
     def add_step(self, step: PipelineStep) -> None:
         """Add a processing step to the pipeline"""
@@ -90,30 +92,96 @@ class Pipeline:
         if self.metrics.duration_seconds is not None:
             self.logger.info(f"Duration: {self.metrics.duration_seconds:.2f}s")
 
-    def execute(self, data: Any) -> Any:
-        """Execute all steps in the pipeline"""
+    def execute(self, data: Any, timeout: Optional[float] = None) -> Any:
+        """Execute all steps in the pipeline with optional timeout and callbacks"""
         self.logger.info(f"Starting pipeline execution: {self.name}")
         self.metrics.start_time = datetime.now()
         current_data = data
-
-        for step in self.steps:
+        
+        # Notify callbacks of pipeline start
+        for callback in self.callbacks:
             try:
-                self.logger.info(f"Executing step: {step.name}")
-                current_data = step.execute(current_data)
-                self.intermediate_results[step.name] = current_data
-
-                # Cleanup dependencies of the current step
-                for dep in step.dependencies:
-                    self._cleanup_intermediate_result(dep)
-
+                callback.on_pipeline_start(self.name, data)
             except Exception as e:
-                self.logger.error(f"Pipeline failed at step {step.name}: {str(e)}")
-                raise
-        self.metrics.end_time = datetime.now()
-        self.metrics.duration_seconds = (self.metrics.end_time - self.metrics.start_time).total_seconds()
-        self.logger.info(f"{self.name} execution completed successfully in {self.metrics.duration_seconds:.2f} seconds")
-        self.result = current_data
-        return current_data
+                self.logger.warning(f"Callback error on pipeline start: {e}")
+
+        # If timeout is specified, use it
+        if timeout is not None:
+            end_time = self.metrics.start_time + timedelta(seconds=timeout)
+        else:
+            end_time = None
+
+        try:
+            for step in self.steps:
+                try:
+                    self.logger.info(f"Executing step: {step.name}")
+                    
+                    # Notify callbacks of step start
+                    for callback in self.callbacks:
+                        try:
+                            callback.on_step_start(self.name, step.name)
+                        except Exception as e:
+                            self.logger.warning(f"Callback error on step start: {e}")
+                    
+                    # Check for timeout before each step
+                    if end_time is not None and datetime.now() > end_time:
+                        raise TimeoutError(f"Pipeline execution timed out after {timeout} seconds")
+                        
+                    step_start_time = datetime.now()
+                    current_data = step.execute(current_data)
+                    step_duration = (datetime.now() - step_start_time).total_seconds()
+                    
+                    # Notify callbacks of step completion
+                    for callback in self.callbacks:
+                        try:
+                            callback.on_step_complete(self.name, step.name, step_duration)
+                        except Exception as e:
+                            self.logger.warning(f"Callback error on step complete: {e}")
+                            
+                    self.intermediate_results[step.name] = current_data
+
+                    # Cleanup dependencies of the current step
+                    for dep in step.dependencies:
+                        self._cleanup_intermediate_result(dep)
+
+                except Exception as e:
+                    self.logger.error(f"Pipeline failed at step {step.name}: {str(e)}")
+                    
+                    # Notify callbacks of step error
+                    for callback in self.callbacks:
+                        try:
+                            callback.on_step_error(self.name, step.name, e)
+                        except Exception as callback_e:
+                            self.logger.warning(f"Callback error on step error: {callback_e}")
+                            
+                    raise
+                    
+            self.metrics.end_time = datetime.now()
+            self.metrics.duration_seconds = (self.metrics.end_time - self.metrics.start_time).total_seconds()
+            self.logger.info(f"{self.name} execution completed successfully in {self.metrics.duration_seconds:.2f} seconds")
+            self.result = current_data
+            
+            # Notify callbacks of pipeline completion
+            for callback in self.callbacks:
+                try:
+                    callback.on_pipeline_complete(self.name, current_data, self.metrics.duration_seconds)
+                except Exception as e:
+                    self.logger.warning(f"Callback error on pipeline complete: {e}")
+                    
+            return current_data
+            
+        except Exception as e:
+            self.metrics.end_time = datetime.now()
+            self.metrics.duration_seconds = (self.metrics.end_time - self.metrics.start_time).total_seconds()
+            
+            # Notify callbacks of pipeline error
+            for callback in self.callbacks:
+                try:
+                    callback.on_pipeline_error(self.name, e, self.metrics.duration_seconds)
+                except Exception as callback_e:
+                    self.logger.warning(f"Callback error on pipeline error: {callback_e}")
+                    
+            raise
 
     def get_status(self) -> Dict:
         """Get the current status of all steps"""
