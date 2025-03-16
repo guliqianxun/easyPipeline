@@ -12,13 +12,14 @@ import pickle
 import logging
 import threading
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
-from typing import Dict, Any, List, Optional, Tuple, Callable, Union, Set
+from concurrent.futures import ProcessPoolExecutor
+from typing import Dict, Any, List, Optional, Callable, Set
 from enum import Enum, auto
 from dataclasses import dataclass
 from datetime import datetime
 import queue
 import copy
+import signal
 
 
 class TaskType(Enum):
@@ -219,6 +220,13 @@ class TaskScheduler:
             
         if wait and self._scheduler_thread:
             self._scheduler_thread.join(timeout)
+            
+            if timeout and self._scheduler_thread.is_alive():
+                self.logger.warning(f"Scheduler thread didn't stop after {timeout}s timeout")
+            
+        # Clear all tasks to free memory
+        if not wait:
+            self.clear_completed_tasks()
 
     def cancel_all(self) -> None:
         """Cancel all pending and running tasks"""
@@ -346,65 +354,128 @@ class TaskScheduler:
         """Main scheduler loop that processes tasks"""
         self.logger.info(f"Starting task scheduler with {self.max_workers} workers")
         
+        # Add signal handlers for graceful shutdown
+        original_sigint_handler = signal.getsignal(signal.SIGINT)
+        original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+        
+        def signal_handler(sig, frame):
+            self.logger.info(f"Received signal {sig}, shutting down scheduler...")
+            self._running = False
+            # Restore original handlers
+            signal.signal(signal.SIGINT, original_sigint_handler)
+            signal.signal(signal.SIGTERM, original_sigterm_handler)
+        
+        # Set up signal handlers
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
+        # Use context manager to ensure proper executor cleanup
         with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {}
+            last_cleanup_time = time.time()
             
-            while self._running or not self.task_queue.empty() or futures:
-                # Check for completed futures
-                completed_futures = []
-                for future in list(futures.keys()):
-                    if future.done():
-                        task_id = futures[future]
-                        self._process_completed_task(task_id, future)
-                        completed_futures.append(future)
-                
-                # Remove completed futures
-                for future in completed_futures:
-                    del futures[future]
-                
-                # Check if we can submit more tasks
-                can_submit = len(futures) < self.max_workers
-                
-                if can_submit and not self.task_queue.empty() and not self._cancel_requested:
-                    try:
-                        task_id = self.task_queue.get_nowait()
-                        
-                        with self._scheduler_lock:
-                            task = self.tasks.get(task_id)
+            try:
+                while self._running or not self.task_queue.empty() or futures:
+                    # Periodically clean up completed tasks to prevent memory leaks
+                    current_time = time.time()
+                    if current_time - last_cleanup_time > 60:  # Clean up every minute
+                        self.clear_completed_tasks(older_than_seconds=300)  # 5 minutes
+                        last_cleanup_time = current_time
+                    
+                    # Check for completed futures
+                    completed_futures = []
+                    for future in list(futures.keys()):
+                        if future.done():
+                            task_id = futures[future]
+                            self._process_completed_task(task_id, future)
+                            completed_futures.append(future)
+                    
+                    # Remove completed futures
+                    for future in completed_futures:
+                        del futures[future]
+                    
+                    # Check if we can submit more tasks
+                    can_submit = len(futures) < self.max_workers
+                    
+                    if can_submit and not self.task_queue.empty() and not self._cancel_requested:
+                        try:
+                            task_id = self.task_queue.get_nowait()
                             
-                            if task and task.status == TaskStatus.PENDING:
-                                # Mark task as running
-                                task.status = TaskStatus.RUNNING
-                                task.started_at = datetime.now()
-                                self.active_tasks.add(task_id)
+                            with self._scheduler_lock:
+                                task = self.tasks.get(task_id)
                                 
-                                # Submit the task to the executor
-                                if task.type == TaskType.PIPELINE:
-                                    future = executor.submit(
-                                        self._execute_pipeline_task,
-                                        task.pipeline_pickle,
-                                        task.data,
-                                        task.pipeline_name
-                                    )
-                                else:  # DATA_CHUNK
-                                    future = executor.submit(
-                                        self._execute_data_chunk_task,
-                                        task.pipeline_pickle,
-                                        task.data,
-                                        task.chunk_id
-                                    )
-                                
-                                futures[future] = task_id
-                                self.logger.debug(f"Started execution of task {task_id}")
-                            else:
-                                self.logger.warning(f"Task {task_id} not found or not pending")
-                    except queue.Empty:
-                        pass
+                                if task and task.status == TaskStatus.PENDING:
+                                    # Mark task as running
+                                    task.status = TaskStatus.RUNNING
+                                    task.started_at = datetime.now()
+                                    self.active_tasks.add(task_id)
+                                    
+                                    # Submit the task to the executor
+                                    if task.type == TaskType.PIPELINE:
+                                        future = executor.submit(
+                                            self._execute_pipeline_task,
+                                            task.pipeline_pickle,
+                                            task.data,
+                                            task.pipeline_name
+                                        )
+                                    else:  # DATA_CHUNK
+                                        future = executor.submit(
+                                            self._execute_data_chunk_task,
+                                            task.pipeline_pickle,
+                                            task.data,
+                                            task.chunk_id
+                                        )
+                                    
+                                    # Set timeout if specified
+                                    if task.timeout:
+                                        self._setup_task_timeout(future, task_id, task.timeout)
+                                    
+                                    futures[future] = task_id
+                                    self.logger.debug(f"Started execution of task {task_id}")
+                                else:
+                                    self.logger.warning(f"Task {task_id} not found or not pending")
+                        except queue.Empty:
+                            pass
+                    
+                    # Small delay to prevent tight loop
+                    time.sleep(0.01)
+                    
+            except Exception as e:
+                self.logger.error(f"Scheduler loop error: {e}")
+            finally:
+                # Restore original signal handlers
+                signal.signal(signal.SIGINT, original_sigint_handler)
+                signal.signal(signal.SIGTERM, original_sigterm_handler)
                 
-                # Small delay to prevent tight loop
-                time.sleep(0.01)
-                
+                # Make sure we process any remaining completed tasks
+                for future, task_id in list(futures.items()):
+                    if future.done():
+                        self._process_completed_task(task_id, future)
+        
         self.logger.info("Task scheduler stopped")
+
+    def _setup_task_timeout(self, future, task_id, timeout):
+        """Setup a timeout for a task future"""
+        def check_timeout():
+            # Wait for the timeout period
+            time.sleep(timeout)
+            
+            # If the future is still running after timeout
+            if not future.done():
+                self.logger.warning(f"Task {task_id} timed out after {timeout} seconds")
+                
+                with self._scheduler_lock:
+                    task = self.tasks.get(task_id)
+                    if task and task.status == TaskStatus.RUNNING:
+                        task.status = TaskStatus.FAILED
+                        task.error = f"Task timed out after {timeout} seconds"
+                        task.completed_at = datetime.now()
+                        
+                # Unfortunately, we can't forcibly cancel a running process in ProcessPoolExecutor
+                # The best we can do is to mark it as failed in our tracking
+        
+        # Start timeout checker in background
+        threading.Thread(target=check_timeout, daemon=True).start()
 
     def _process_completed_task(self, task_id: str, future) -> None:
         """Process a completed task future"""
@@ -432,6 +503,13 @@ class TaskScheduler:
                 task.status = TaskStatus.FAILED
                 task.completed_at = datetime.now()
                 self.logger.error(f"Task {task_id} failed: {e}")
+            
+
+                if self.result_callback:
+                    try:
+                        self.result_callback(task_id, None)
+                    except Exception as callback_e:
+                        self.logger.error(f"Error in result callback for failed task: {callback_e}")
             
             # Remove from active tasks
             self.active_tasks.discard(task_id)
@@ -485,3 +563,123 @@ class TaskScheduler:
                 })
                 
         return results
+
+    def cancel_task(self, task_id: str) -> bool:
+        """
+        Cancel a specific task if possible
+        
+        Args:
+            task_id: ID of task to cancel
+            
+        Returns:
+            True if task was cancelled, False otherwise
+        """
+        with self._scheduler_lock:
+            task = self.tasks.get(task_id)
+            if not task:
+                return False
+                
+            # If task is pending, just mark as cancelled
+            if task.status == TaskStatus.PENDING:
+                task.status = TaskStatus.CANCELLED
+                task.completed_at = datetime.now()
+                
+                self.logger.info(f"Cancelled pending task {task_id}")
+                return True
+                
+            elif task.status == TaskStatus.RUNNING:
+                self.logger.warning(f"Task {task_id} is already running and cannot be cancelled directly")
+                return False
+                
+            # Task already completed/failed/cancelled
+            return False
+
+    def mark_task_as_failed(self, task_id: str, error_message: str) -> bool:
+        """
+        Manually mark a task as failed
+        
+        Args:
+            task_id: ID of task to mark failed
+            error_message: Error message to set
+            
+        Returns:
+            True if task was marked as failed, False otherwise
+        """
+        with self._scheduler_lock:
+            task = self.tasks.get(task_id)
+            if not task:
+                return False
+                
+            # Can only mark pending or running tasks as failed
+            if task.status in [TaskStatus.PENDING, TaskStatus.RUNNING]:
+                task.status = TaskStatus.FAILED
+                task.error = error_message
+                task.completed_at = datetime.now()
+                
+                # Remove from active tasks
+                self.active_tasks.discard(task_id)
+                
+                # Call result callback to notify of failure
+                if self.result_callback:
+                    try:
+                        self.result_callback(task_id, None)
+                    except Exception as e:
+                        self.logger.error(f"Error in result callback for marked failed task: {e}")
+                
+                self.logger.info(f"Manually marked task {task_id} as failed: {error_message}")
+                return True
+                
+            return False
+
+    def get_failed_tasks(self) -> Dict[str, Task]:
+        """Get all failed tasks"""
+        failed_tasks = {}
+        with self._scheduler_lock:
+            for task_id, task in self.tasks.items():
+                if task.status == TaskStatus.FAILED:
+                    failed_tasks[task_id] = task
+        return failed_tasks
+
+    def clear_failed_tasks(self) -> int:
+        """
+        Clear all failed tasks from memory
+        
+        Returns:
+            Number of tasks cleared
+        """
+        to_remove = []
+        
+        with self._scheduler_lock:
+            for task_id, task in self.tasks.items():
+                if task.status == TaskStatus.FAILED:
+                    to_remove.append(task_id)
+            
+            for task_id in to_remove:
+                del self.tasks[task_id]
+                
+        self.logger.info(f"Cleared {len(to_remove)} failed tasks")
+        return len(to_remove)
+
+    def resize_worker_pool(self, max_workers: int) -> None:
+        """
+        Resize the worker pool (must be called when no tasks are running)
+        
+        Args:
+            max_workers: New maximum number of worker processes
+        """
+        if len(self.active_tasks) > 0:
+            self.logger.error("Cannot resize worker pool while tasks are running")
+            return
+            
+        was_running = self._running
+        
+        if was_running:
+            self.stop(wait=True)
+            
+        self.max_workers = max(1, max_workers)
+        self.min_workers = min(self.min_workers, self.max_workers)
+        
+        self.logger.info(f"Resized worker pool to {self.max_workers} workers")
+        
+        if was_running:
+            self.start()

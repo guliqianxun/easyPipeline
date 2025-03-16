@@ -44,7 +44,8 @@ class PipelineManager:
                  max_workers: Optional[int] = None,
                  min_workers: Optional[int] = 1,
                  logger: logging.Logger = None,
-                 callbacks: Optional[List[ProgressCallback]] = None):
+                 callbacks: Optional[List[ProgressCallback]] = None,
+                 auto_cleanup_failed: bool = True):
         """
         Initialize the pipeline manager.
         
@@ -55,6 +56,7 @@ class PipelineManager:
             min_workers: Minimum number of worker processes
             logger: Optional logger (creates one if not provided)
             callbacks: Optional list of progress callbacks
+            auto_cleanup_failed: Automatically cleanup failed tasks
         """
         self.name = name
         self.execution_mode = execution_mode
@@ -63,6 +65,7 @@ class PipelineManager:
         self.pipelines: Dict[str, Pipeline] = {}
         self.logger = logger if logger is not None else logging.getLogger(f"pipeline_manager.{name}")
         self.callbacks = callbacks or []
+        self.auto_cleanup_failed = auto_cleanup_failed
         
         # To track execution metrics
         self.execution_metrics: Dict[str, Dict[str, Union[int, float]]] = {}
@@ -81,6 +84,9 @@ class PipelineManager:
         # Task ID mappings
         self._pipeline_tasks: Dict[str, Dict[str, str]] = {}  # {pipeline_name: {data_id: task_id}}
         self._batch_tasks: Dict[str, List[str]] = {}  # {pipeline_name: [task_ids]}
+        
+        # Failed task tracking
+        self._failed_tasks: List[str] = []
         
         # Initialize multiprocessing support if needed
         if execution_mode in [ExecutionMode.PARALLEL, ExecutionMode.BATCH]:
@@ -425,11 +431,213 @@ class PipelineManager:
 
     def _on_task_completed(self, task_id: str, result: Any) -> None:
         """Callback when a task is completed"""
-        # This could be used to implement additional logic when tasks complete
-        pass
+        # Check the task status to see if it failed
+        with self.task_scheduler._scheduler_lock:
+            task = self.task_scheduler.tasks.get(task_id)
+            if task and task.status == TaskStatus.FAILED:
+                self._on_task_failed(task_id, task)
+            
+        # Additional custom handling for completed tasks can go here
+
+    def _on_task_failed(self, task_id: str, task) -> None:
+        """Handle a failed task"""
+        # Log the failure with details
+        self.logger.error(f"Task {task_id} ({task.pipeline_name}) failed: {task.error}")
+        
+        # Add to failed tasks list
+        self._failed_tasks.append(task_id)
+        
+        # Notify callbacks
+        for callback in self.callbacks:
+            try:
+                callback.on_pipeline_error(task.pipeline_name, Exception(task.error), 
+                                          task.duration or 0.0)
+            except Exception as e:
+                self.logger.warning(f"Error in failure callback: {e}")
+        
+        # Update metrics
+        self._update_metrics(task.pipeline_name, False, task.duration or 0.0)
+        
+        # Auto cleanup if enabled
+        if self.auto_cleanup_failed:
+            self.cleanup_failed_task(task_id)
+
+    def cleanup_failed_task(self, task_id: str) -> bool:
+        """
+        Cleanup resources associated with a failed task
+        
+        Args:
+            task_id: ID of the failed task
+            
+        Returns:
+            True if cleanup was successful, False otherwise
+        """
+        try:
+            # Get the task from scheduler
+            with self.task_scheduler._scheduler_lock:
+                task = self.task_scheduler.tasks.get(task_id)
+                if not task:
+                    self.logger.warning(f"Task {task_id} not found for cleanup")
+                    return False
+                
+                # If the task isn't marked as failed yet, mark it
+                if task.status != TaskStatus.FAILED:
+                    task.status = TaskStatus.FAILED
+                    task.completed_at = datetime.now() if not task.completed_at else task.completed_at
+                
+                # Remove from active tasks
+                self.task_scheduler.active_tasks.discard(task_id)
+                
+                # Clear any large data fields to free memory
+                task.data = None
+                task.pipeline_pickle = None
+                task.result = None
+                
+                # Keep minimal error information
+                if task.error and len(task.error) > 1000:
+                    task.error = task.error[:997] + "..."
+                
+                # Remove from tracking dictionaries
+                self._remove_task_from_tracking(task_id, task.pipeline_name)
+                
+                self.logger.info(f"Cleaned up failed task {task_id}")
+                return True
+            
+        except Exception as e:
+            self.logger.error(f"Error cleaning up failed task {task_id}: {e}")
+            return False
+
+    def _remove_task_from_tracking(self, task_id: str, pipeline_name: str) -> None:
+        """Remove a task from all tracking dictionaries"""
+        # Remove from pipeline tasks
+        if pipeline_name in self._pipeline_tasks:
+            data_ids = [did for did, tid in self._pipeline_tasks[pipeline_name].items() 
+                        if tid == task_id]
+            for data_id in data_ids:
+                self._pipeline_tasks[pipeline_name].pop(data_id, None)
+        
+        # Remove from batch tasks
+        if pipeline_name in self._batch_tasks:
+            if task_id in self._batch_tasks[pipeline_name]:
+                self._batch_tasks[pipeline_name].remove(task_id)
+
+    def cleanup_all_failed_tasks(self) -> int:
+        """
+        Clean up all failed tasks
+        
+        Returns:
+            Number of tasks cleaned up
+        """
+        cleaned_count = 0
+        
+        # Get a copy of the failed tasks list since we'll be modifying it
+        tasks_to_clean = self._failed_tasks.copy()
+        
+        for task_id in tasks_to_clean:
+            if self.cleanup_failed_task(task_id):
+                cleaned_count += 1
+                self._failed_tasks.remove(task_id)
+        
+        # Also check for any failed tasks in the scheduler that might not be in our list
+        with self.task_scheduler._scheduler_lock:
+            for task_id, task in list(self.task_scheduler.tasks.items()):
+                if task.status == TaskStatus.FAILED and task_id not in self._failed_tasks:
+                    if self.cleanup_failed_task(task_id):
+                        cleaned_count += 1
+        
+        self.logger.info(f"Cleaned up {cleaned_count} failed tasks")
+        return cleaned_count
+
+    def get_failed_tasks(self) -> List[Dict[str, Any]]:
+        """
+        Get information about all failed tasks
+        
+        Returns:
+            List of dictionaries with task information
+        """
+        failed_tasks_info = []
+        
+        with self.task_scheduler._scheduler_lock:
+            for task_id in self._failed_tasks:
+                task = self.task_scheduler.tasks.get(task_id)
+                if task:
+                    failed_tasks_info.append({
+                        'task_id': task_id,
+                        'pipeline_name': task.pipeline_name,
+                        'type': task.type.name,
+                        'chunk_id': task.chunk_id,
+                        'error': task.error,
+                        'created_at': task.created_at,
+                        'completed_at': task.completed_at,
+                        'duration': task.duration
+                    })
+        
+        return failed_tasks_info
+
+    def retry_failed_task(self, task_id: str) -> Optional[str]:
+        """
+        Retry a failed task
+        
+        Args:
+            task_id: ID of the failed task to retry
+            
+        Returns:
+            New task ID if successful, None otherwise
+        """
+        with self.task_scheduler._scheduler_lock:
+            task = self.task_scheduler.tasks.get(task_id)
+            if not task or task.status != TaskStatus.FAILED:
+                self.logger.warning(f"Task {task_id} not found or not in failed state")
+                return None
+            
+            # Create a new task with the same parameters
+            if task.type == TaskType.PIPELINE:
+                # For a regular pipeline task
+                new_task_id = self.task_scheduler.submit_pipeline_task(
+                    task.pipeline_name,
+                    task.pipeline_pickle,
+                    task.data,
+                    task.timeout
+                )
+            else:
+                # For a data chunk task
+                new_task_id = self.task_scheduler.submit_data_chunk_task(
+                    task.pipeline_name,
+                    task.pipeline_pickle,
+                    task.data,
+                    task.chunk_id,
+                    task.timeout
+                )
+            
+            # Update tracking dictionaries
+            self._update_tracking_for_retry(task_id, new_task_id, task.pipeline_name)
+            
+            # If original task is in failed tasks list, remove it
+            if task_id in self._failed_tasks:
+                self._failed_tasks.remove(task_id)
+            
+            self.logger.info(f"Retrying failed task {task_id} with new task {new_task_id}")
+            return new_task_id
+
+    def _update_tracking_for_retry(self, old_task_id: str, new_task_id: str, pipeline_name: str) -> None:
+        """Update tracking dictionaries when retrying a task"""
+        # Update pipeline tasks
+        if pipeline_name in self._pipeline_tasks:
+            for data_id, task_id in list(self._pipeline_tasks[pipeline_name].items()):
+                if task_id == old_task_id:
+                    self._pipeline_tasks[pipeline_name][data_id] = new_task_id
+        
+        # Update batch tasks
+        if pipeline_name in self._batch_tasks:
+            if old_task_id in self._batch_tasks[pipeline_name]:
+                idx = self._batch_tasks[pipeline_name].index(old_task_id)
+                self._batch_tasks[pipeline_name][idx] = new_task_id
 
     def cleanup(self) -> None:
         """Clean up resources and completed tasks"""
+        # Clean up failed tasks first
+        self.cleanup_all_failed_tasks()
+        
         # Stop scheduler if running
         if hasattr(self, 'task_scheduler') and self.task_scheduler._running:
             self.task_scheduler.stop(wait=True, timeout=1.0)
